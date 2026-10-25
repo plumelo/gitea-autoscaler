@@ -53,6 +53,10 @@ pub struct RunnersResponse {
 pub struct GiteaClient {
     client: Client,
     base_url: String,
+    /// Name prefix shared by this fleet's runner registrations
+    /// (`{runner_deployment}-`), derived from the autoscaled Deployment's
+    /// name. Only registrations carrying this prefix are ever swept.
+    runner_prefix: String,
 }
 
 impl GiteaClient {
@@ -85,6 +89,7 @@ impl GiteaClient {
         Ok(Self {
             client,
             base_url: config.gitea_url.trim_end_matches('/').to_string(),
+            runner_prefix: format!("{}-", config.runner_deployment),
         })
     }
 
@@ -194,14 +199,25 @@ impl GiteaClient {
         Ok((queued, busy_runners))
     }
 
+    /// Delete stale runner registrations belonging to this fleet only.
+    ///
+    /// A registration is stale only if its name starts with the fleet prefix
+    /// (`{runner_deployment}-`, i.e. it was registered by a pod of the
+    /// autoscaled Deployment), Gitea reports it `offline`, it is not busy,
+    /// and no live Kubernetes pod bears its name. Runners outside the fleet
+    /// (e.g. persistent VM runners) are never touched.
     pub async fn cleanup_offline_runners(
         &self,
         live_runner_names: &HashSet<String>,
         busy_runners: &HashSet<String>,
     ) -> Result<u32> {
         let runners = self.list_runners().await?;
-        let stale_runner_ids =
-            select_stale_offline_runners(&runners, live_runner_names, busy_runners);
+        let stale_runner_ids = select_stale_offline_runners(
+            &runners,
+            &self.runner_prefix,
+            live_runner_names,
+            busy_runners,
+        );
         let stale_count = stale_runner_ids.len() as u32;
 
         for runner in stale_runner_ids {
@@ -256,13 +272,22 @@ impl GiteaClient {
     }
 }
 
+/// Select runner registrations that are safe to delete.
+///
+/// A runner is a sweep candidate only if it belongs to the autoscaled fleet —
+/// its name starts with `runner_prefix`, which Kubernetes guarantees for pods
+/// (and thus hostnames/registrations) of the Deployment — and it is
+/// `offline`, not busy, and missing from both the live pod set and the busy
+/// runner set. Foreign runners can never match the prefix.
 fn select_stale_offline_runners<'a>(
     runners: &'a [Runner],
+    runner_prefix: &str,
     live_runner_names: &HashSet<String>,
     busy_runners: &HashSet<String>,
 ) -> Vec<&'a Runner> {
     runners
         .iter()
+        .filter(|runner| runner.name.starts_with(runner_prefix))
         .filter(|runner| runner.status.eq_ignore_ascii_case("offline"))
         .filter(|runner| !runner.busy)
         .filter(|runner| !live_runner_names.contains(&runner.name))
@@ -275,6 +300,11 @@ mod tests {
     use super::{Runner, select_stale_offline_runners};
     use std::collections::HashSet;
 
+    // Fleet prefix for a Deployment named `gitea-actions-runner`: its pods —
+    // and therefore its runner registrations — are always named
+    // `gitea-actions-runner-…`.
+    const FLEET_PREFIX: &str = "gitea-actions-runner-";
+
     fn runner(id: u64, name: &str, status: &str, busy: bool) -> Runner {
         Runner {
             busy,
@@ -286,14 +316,15 @@ mod tests {
 
     #[test]
     fn selects_offline_runners_missing_from_cluster() {
-        let live_runner_names = HashSet::from(["runner-live".to_string()]);
+        let live_runner_names = HashSet::from(["gitea-actions-runner-aaa-111".to_string()]);
         let busy_runners = HashSet::new();
         let runners = vec![
-            runner(1, "runner-live", "offline", false),
-            runner(2, "runner-stale", "offline", false),
+            runner(1, "gitea-actions-runner-aaa-111", "offline", false),
+            runner(2, "gitea-actions-runner-bbb-222", "offline", false),
         ];
 
-        let selected = select_stale_offline_runners(&runners, &live_runner_names, &busy_runners);
+        let selected =
+            select_stale_offline_runners(&runners, FLEET_PREFIX, &live_runner_names, &busy_runners);
 
         assert_eq!(selected, vec![&runners[1]]);
     }
@@ -301,14 +332,18 @@ mod tests {
     #[test]
     fn skips_online_and_busy_runners() {
         let live_runner_names = HashSet::new();
-        let busy_runners = HashSet::from(["runner-busy".to_string(), "runner-job".to_string()]);
+        let busy_runners = HashSet::from([
+            "gitea-actions-runner-ccc-333".to_string(),
+            "gitea-actions-runner-ddd-444".to_string(),
+        ]);
         let runners = vec![
-            runner(1, "runner-online", "online", false),
-            runner(2, "runner-busy", "offline", true),
-            runner(3, "runner-job", "offline", false),
+            runner(1, "gitea-actions-runner-eee-555", "online", false),
+            runner(2, "gitea-actions-runner-ccc-333", "offline", true),
+            runner(3, "gitea-actions-runner-ddd-444", "offline", false),
         ];
 
-        let selected = select_stale_offline_runners(&runners, &live_runner_names, &busy_runners);
+        let selected =
+            select_stale_offline_runners(&runners, FLEET_PREFIX, &live_runner_names, &busy_runners);
 
         assert_eq!(selected, Vec::<&Runner>::new());
     }
@@ -317,10 +352,29 @@ mod tests {
     fn matches_offline_status_case_insensitively() {
         let live_runner_names = HashSet::new();
         let busy_runners = HashSet::new();
-        let runners = vec![runner(9, "runner-stale", "OffLine", false)];
+        let runners = vec![runner(9, "gitea-actions-runner-fff-666", "OffLine", false)];
 
-        let selected = select_stale_offline_runners(&runners, &live_runner_names, &busy_runners);
+        let selected =
+            select_stale_offline_runners(&runners, FLEET_PREFIX, &live_runner_names, &busy_runners);
 
         assert_eq!(selected, vec![&runners[0]]);
+    }
+
+    #[test]
+    fn never_selects_runners_outside_the_fleet() {
+        // Regression: foreign runners (persistent VM runners like pml1..pml4)
+        // go offline during routine reboots and never re-register — the sweep
+        // must not delete them, whatever their state.
+        let live_runner_names = HashSet::new();
+        let busy_runners = HashSet::new();
+        let runners = vec![
+            runner(1, "pml1", "offline", false),
+            runner(2, "pml4", "offline", false),
+        ];
+
+        let selected =
+            select_stale_offline_runners(&runners, FLEET_PREFIX, &live_runner_names, &busy_runners);
+
+        assert_eq!(selected, Vec::<&Runner>::new());
     }
 }
