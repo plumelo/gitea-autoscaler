@@ -2,7 +2,9 @@ name: Auto-merge dependabot PRs
 
 # Merges dependabot PRs once their CI run succeeds. Triggered by the CI
 # workflow's completion (workflow_run), so the merge attempt only ever
-# happens after the PR's checks are green.
+# happens after the PR's checks are green. Dependabot PRs are identified by
+# author (labels from dependabot.yml are also applied when they exist, but
+# dependabot opens PRs unlabeled if the repo is missing them).
 on:
   workflow_run:
     workflows: [CI]
@@ -27,8 +29,8 @@ jobs:
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           pr_number="$(gh pr list --repo "$REPO" --state open \
-            --json number,headRefOid,labels \
-            --jq '.[] | select(.headRefOid == env.HEAD_SHA and any(.labels[]; .name == "dependabot")) | .number' \
+            --json number,headRefOid,author \
+            --jq '.[] | select(.headRefOid == env.HEAD_SHA and (.author.login == "app/dependabot" or .author.login == "dependabot[bot]")) | .number' \
             | head -n 1)"
           if [[ -z "$pr_number" ]]; then
             echo "No open dependabot PR matches head sha $HEAD_SHA — nothing to merge."
