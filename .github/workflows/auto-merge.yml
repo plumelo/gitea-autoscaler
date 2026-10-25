@@ -36,7 +36,7 @@ jobs:
             echo "No open dependabot PR matches head sha $HEAD_SHA — nothing to merge."
             exit 0
           fi
-          echo "Merging PR #$pr_number (CI green, labeled dependabot)."
+          echo "Merging PR #$pr_number (CI green, authored by dependabot)."
           if ! gh pr merge --repo "$REPO" "$pr_number" --squash --delete-branch; then
             echo "Direct merge failed — retrying with auto-merge (the default token"
             echo "cannot push merges for PRs that modify workflow files; GitHub's"
