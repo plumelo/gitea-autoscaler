@@ -158,4 +158,4 @@ filesystem writes.
 Prebuilt at `ghcr.io/plumelo/gitea-autoscaler`:
 
 - `main` — every push to `main`
-- `vX.Y.Z` / `X.Y.Z` — release tags (pushed when a `v*` git tag is cut)
+- `vX.Y.Z` — releases (published when a `v*` git tag is cut)
