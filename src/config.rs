@@ -28,6 +28,10 @@ pub struct Config {
     pub poll_interval: u64,
     /// Seconds to wait after last activity before scaling down.
     pub scale_down_delay: u64,
+    /// Optional `runs-on` label a job must carry to be counted (e.g. `k8s`).
+    ///
+    /// When unset, every queued and in-progress job drives scaling.
+    pub job_label: Option<String>,
 }
 
 impl Config {
@@ -44,6 +48,7 @@ impl Config {
     ///   - `MAX_REPLICAS`       (default: `3`)
     ///   - `POLL_INTERVAL`      (default: `10`)
     ///   - `SCALE_DOWN_DELAY`   (default: `1000`)
+    ///   - `JOB_LABEL`          (default: unset — count every job)
     pub fn from_env() -> Result<Self> {
         let gitea_url =
             env::var("GITEA_URL").context("GITEA_URL environment variable is required")?;
@@ -88,6 +93,13 @@ impl Config {
             .parse::<u64>()
             .context("SCALE_DOWN_DELAY must be a valid integer")?;
 
+        // Optional: only count jobs carrying this `runs-on` label. An unset
+        // or blank value counts every job (upstream behavior).
+        let job_label = env::var("JOB_LABEL")
+            .ok()
+            .filter(|label| !label.trim().is_empty())
+            .map(|label| label.trim().to_string());
+
         Ok(Self {
             gitea_url,
             gitea_auth,
@@ -97,6 +109,7 @@ impl Config {
             max_replicas,
             poll_interval,
             scale_down_delay,
+            job_label,
         })
     }
 
@@ -107,7 +120,7 @@ impl Config {
             GiteaAuth::Token(_) => "token".to_string(),
         };
         format!(
-            "gitea={} auth={} deployment={}/{} replicas=[{},{}] poll={}s cooldown={}s",
+            "gitea={} auth={} deployment={}/{} replicas=[{},{}] poll={}s cooldown={}s job_label={}",
             self.gitea_url,
             auth_kind,
             self.runner_namespace,
@@ -116,6 +129,7 @@ impl Config {
             self.max_replicas,
             self.poll_interval,
             self.scale_down_delay,
+            self.job_label.as_deref().unwrap_or("-"),
         )
     }
 }

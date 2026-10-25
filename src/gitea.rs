@@ -27,6 +27,10 @@ pub struct Job {
     pub runner_name: String,
     #[serde(default)]
     pub name: String,
+    /// `runs-on` labels required by the job (Gitea serialises the job's
+    /// `RunsOn` as this `labels` array).
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
@@ -57,6 +61,9 @@ pub struct GiteaClient {
     /// (`{runner_deployment}-`), derived from the autoscaled Deployment's
     /// name. Only registrations carrying this prefix are ever swept.
     runner_prefix: String,
+    /// Optional `runs-on` label restricting which jobs count toward
+    /// scaling; `None` counts every job.
+    job_label: Option<String>,
 }
 
 impl GiteaClient {
@@ -90,12 +97,17 @@ impl GiteaClient {
             client,
             base_url: config.gitea_url.trim_end_matches('/').to_string(),
             runner_prefix: format!("{}-", config.runner_deployment),
+            job_label: config.job_label.clone(),
         })
     }
 
     /// Fetch queued jobs and live in-progress jobs from the admin API.
     ///
     /// Returns `(queued_job_count, set_of_busy_live_runner_pod_names)`.
+    ///
+    /// When a `job_label` is configured, only jobs whose `labels` contain it
+    /// are counted — jobs served by other runner fleets are invisible to the
+    /// autoscaler. Without one, every job counts.
     ///
     /// In-progress jobs whose `runner_name` is not present in Kubernetes are
     /// treated as stale and ignored for scaling decisions. This makes the
@@ -138,31 +150,11 @@ impl GiteaClient {
 
             let page_total = data.total_count as u32;
 
-            for job in &data.jobs {
-                match job.status.as_str() {
-                    "queued" => queued += 1,
-                    "in_progress" if !job.runner_name.is_empty() => {
-                        if live_runner_names.contains(&job.runner_name) {
-                            busy_runners.insert(job.runner_name.clone());
-                            debug!(
-                                job_id = job.id,
-                                name = %job.name,
-                                runner = %job.runner_name,
-                                "in-progress job on live runner"
-                            );
-                        } else {
-                            stale_in_progress += 1;
-                            debug!(
-                                job_id = job.id,
-                                name = %job.name,
-                                runner = %job.runner_name,
-                                "ignoring in-progress job on non-live runner"
-                            );
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            let (page_queued, page_busy, page_stale) =
+                summarize_page(&data.jobs, self.job_label.as_deref(), live_runner_names);
+            queued += page_queued;
+            stale_in_progress += page_stale;
+            busy_runners.extend(page_busy);
 
             // Fast exit: if busy runners already >= max, no scaling action is
             // possible (can't scale up past max, won't scale down while busy).
@@ -272,6 +264,72 @@ impl GiteaClient {
     }
 }
 
+/// Whether `job` counts toward scaling decisions for this fleet.
+///
+/// With `job_label` set, only jobs whose `labels` (the `runs-on` values Gitea
+/// reports for the job) contain the configured label count — the runner
+/// fleet only takes jobs carrying one of its own labels, so anything else
+/// is work this Deployment can never run. With no label configured, every
+/// job counts (upstream behavior).
+fn job_matches_label(job: &Job, job_label: Option<&str>) -> bool {
+    match job_label {
+        Some(label) => job.labels.iter().any(|candidate| candidate == label),
+        None => true,
+    }
+}
+
+/// Fold one page of fetched jobs into scaling inputs.
+///
+/// Returns `(queued_count, busy_live_runner_pod_names, stale_in_progress_count)`.
+/// Jobs that do not match `job_label` (when configured) are skipped entirely:
+/// they contribute neither to the queued count nor to the busy-runner set.
+fn summarize_page(
+    jobs: &[Job],
+    job_label: Option<&str>,
+    live_runner_names: &HashSet<String>,
+) -> (u32, HashSet<String>, u32) {
+    let mut queued = 0u32;
+    let mut busy_runners = HashSet::new();
+    let mut stale_in_progress = 0u32;
+
+    for job in jobs {
+        if !job_matches_label(job, job_label) {
+            debug!(
+                job_id = job.id,
+                name = %job.name,
+                "skipping job without the configured label"
+            );
+            continue;
+        }
+
+        match job.status.as_str() {
+            "queued" => queued += 1,
+            "in_progress" if !job.runner_name.is_empty() => {
+                if live_runner_names.contains(&job.runner_name) {
+                    busy_runners.insert(job.runner_name.clone());
+                    debug!(
+                        job_id = job.id,
+                        name = %job.name,
+                        runner = %job.runner_name,
+                        "in-progress job on live runner"
+                    );
+                } else {
+                    stale_in_progress += 1;
+                    debug!(
+                        job_id = job.id,
+                        name = %job.name,
+                        runner = %job.runner_name,
+                        "ignoring in-progress job on non-live runner"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (queued, busy_runners, stale_in_progress)
+}
+
 /// Select runner registrations that are safe to delete.
 ///
 /// A runner is a sweep candidate only if it belongs to the autoscaled fleet —
@@ -297,7 +355,7 @@ fn select_stale_offline_runners<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{Runner, select_stale_offline_runners};
+    use super::{Job, Runner, job_matches_label, select_stale_offline_runners, summarize_page};
     use std::collections::HashSet;
 
     // Fleet prefix for a Deployment named `gitea-actions-runner`: its pods —
@@ -311,6 +369,16 @@ mod tests {
             id,
             name: name.to_string(),
             status: status.to_string(),
+        }
+    }
+
+    fn job(id: u64, name: &str, status: &str, runner_name: &str, labels: &[&str]) -> Job {
+        Job {
+            id,
+            status: status.to_string(),
+            runner_name: runner_name.to_string(),
+            name: name.to_string(),
+            labels: labels.iter().map(|label| label.to_string()).collect(),
         }
     }
 
@@ -376,5 +444,113 @@ mod tests {
             select_stale_offline_runners(&runners, FLEET_PREFIX, &live_runner_names, &busy_runners);
 
         assert_eq!(selected, Vec::<&Runner>::new());
+    }
+
+    #[test]
+    fn job_labels_default_to_empty_when_the_api_omits_them() {
+        let job: Job = serde_json::from_str(r#"{"id":7,"status":"queued"}"#).unwrap();
+
+        assert!(job.labels.is_empty());
+    }
+
+    #[test]
+    fn matches_only_jobs_carrying_the_configured_label() {
+        let labelled = job(1, "build", "queued", "", &["k8s", "linux"]);
+        let unlabelled = job(2, "test", "queued", "", &[]);
+
+        assert!(job_matches_label(&labelled, Some("k8s")));
+        assert!(!job_matches_label(&unlabelled, Some("k8s")));
+        // Without a configured label every job matches (upstream behavior).
+        assert!(job_matches_label(&labelled, None));
+        assert!(job_matches_label(&unlabelled, None));
+    }
+
+    #[test]
+    fn counts_only_jobs_matching_the_configured_label() {
+        let live_runner_names = HashSet::from([
+            "gitea-actions-runner-aaa-111".to_string(),
+            "gitea-actions-runner-bbb-222".to_string(),
+        ]);
+        let jobs = vec![
+            job(1, "build", "queued", "", &["k8s"]),
+            job(2, "lint", "queued", "", &["linux"]),
+            job(
+                3,
+                "package",
+                "in_progress",
+                "gitea-actions-runner-aaa-111",
+                &["k8s"],
+            ),
+            job(
+                4,
+                "deploy",
+                "in_progress",
+                "gitea-actions-runner-bbb-222",
+                &["linux"],
+            ),
+            job(
+                5,
+                "audit",
+                "in_progress",
+                "gitea-actions-runner-zzz-999",
+                &["k8s"],
+            ),
+        ];
+
+        let (queued, busy_runners, stale_in_progress) =
+            summarize_page(&jobs, Some("k8s"), &live_runner_names);
+
+        assert_eq!(queued, 1);
+        assert_eq!(
+            busy_runners,
+            HashSet::from(["gitea-actions-runner-aaa-111".to_string()])
+        );
+        assert_eq!(stale_in_progress, 1);
+    }
+
+    #[test]
+    fn counts_every_job_when_no_label_is_configured() {
+        let live_runner_names = HashSet::from([
+            "gitea-actions-runner-aaa-111".to_string(),
+            "gitea-actions-runner-bbb-222".to_string(),
+        ]);
+        let jobs = vec![
+            job(1, "build", "queued", "", &["k8s"]),
+            job(2, "lint", "queued", "", &["linux"]),
+            job(
+                3,
+                "package",
+                "in_progress",
+                "gitea-actions-runner-aaa-111",
+                &["k8s"],
+            ),
+            job(
+                4,
+                "deploy",
+                "in_progress",
+                "gitea-actions-runner-bbb-222",
+                &["linux"],
+            ),
+            job(
+                5,
+                "audit",
+                "in_progress",
+                "gitea-actions-runner-zzz-999",
+                &["k8s"],
+            ),
+        ];
+
+        let (queued, busy_runners, stale_in_progress) =
+            summarize_page(&jobs, None, &live_runner_names);
+
+        assert_eq!(queued, 2);
+        assert_eq!(
+            busy_runners,
+            HashSet::from([
+                "gitea-actions-runner-aaa-111".to_string(),
+                "gitea-actions-runner-bbb-222".to_string()
+            ])
+        );
+        assert_eq!(stale_in_progress, 1);
     }
 }
