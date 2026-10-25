@@ -17,8 +17,10 @@ and patches the runner Deployment's scale:
 
 - **Scale up** — immediately patches the Deployment replicas.
 - **Scale down** — only after a cooldown (`SCALE_DOWN_DELAY` seconds of the
-  surplus persisting), and only by deleting *idle* pods; a pod that is running
-  a job is never killed.
+  surplus persisting): it patches the `pod-deletion-cost` annotation high on
+  busy runners (and resets idle ones), then shrinks the Deployment's replica
+  count, so the ReplicaSet evicts idle pods first and a pod running a job is
+  never a victim.
 - **Stale in-progress jobs** — in-progress jobs whose runner no longer exists
   in Kubernetes are ignored, so vanished runners don't pin the scale up.
 - **Stale-runner sweep** — deletes Gitea runner registrations that are
@@ -39,6 +41,10 @@ Adapted from [github.com/bearlyplayz/gitea-autoscaler](https://github.com/bearly
 2. **Optional job-label filter** — when `JOB_LABEL` is set, only jobs
    carrying that `runs-on` label count toward scaling (see below). Upstream
    counted every queued/in-progress job.
+3. **Scale-down via pod-deletion-cost** — surplus is removed by shrinking
+   the Deployment while busy runners carry a high `pod-deletion-cost`
+   annotation, instead of deleting idle pods by hand. Upstream deleted pods
+   directly, which briefly makes the ReplicaSet spawn replacements.
 
 ## Configuration
 
@@ -91,7 +97,7 @@ rules:
     verbs: ["get", "patch"]
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["list", "delete"]
+    verbs: ["list", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
