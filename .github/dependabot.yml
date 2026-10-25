@@ -1,0 +1,17 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    labels: [dependabot, cargo]
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    labels: [dependabot, actions]
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /
+    labels: [dependabot, docker]
+    schedule:
+      interval: weekly
