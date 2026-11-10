@@ -52,7 +52,7 @@ impl Scaler {
             .await
             .context("failed to get runner Deployment")?;
 
-        Ok(deploy.spec.and_then(|s| s.replicas).unwrap_or(1))
+        Ok(deploy.spec.replicas.unwrap_or(1))
     }
 
     /// Set the replica count of the runner Deployment via the Scale subresource.

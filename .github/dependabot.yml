@@ -5,6 +5,10 @@ updates:
     labels: [dependabot, cargo]
     schedule:
       interval: weekly
+    groups:
+      cargo:
+        applies-to: version-updates
+        dependency-type: production
   - package-ecosystem: github-actions
     directory: /
     labels: [dependabot, actions]
